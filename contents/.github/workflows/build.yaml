@@ -1,0 +1,14 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: p6m-actions/js-pnpm-setup@v1
+      - uses: p6m-actions/js-pnpm-build@v1
