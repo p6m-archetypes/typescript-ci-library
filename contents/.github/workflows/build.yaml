@@ -21,7 +21,7 @@ jobs:
       - name: Setup pnpm
         uses: p6m-actions/js-pnpm-setup@v1
 
-       - name: Cut Patch Version
+      - name: Cut Patch Version
         if: github.ref_name == 'main'
         id: cut-patch
         uses: p6m-actions/dotnet-cut-tag@v1
