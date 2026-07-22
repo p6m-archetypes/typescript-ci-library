@@ -24,7 +24,7 @@ jobs:
       - name: Cut Patch Version
         if: github.ref_name == 'main'
         id: cut-patch
-        uses: p6m-actions/dotnet-cut-tag@v1
+        uses: p6m-actions/js-pnpm-cut-tag@v1
         with:
           version-level: patch
           
