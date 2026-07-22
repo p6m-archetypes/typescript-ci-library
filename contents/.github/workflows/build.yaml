@@ -5,10 +5,84 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  IMAGE_NAME: {{ project-name }}
+  APPLICATION_NAME: {{ project-name }}
+  
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: p6m-actions/js-pnpm-setup@v1
-      - uses: p6m-actions/js-pnpm-build@v1
+      - name: Setup pnpm
+        uses: p6m-actions/js-pnpm-setup@v1
+
+       - name: Cut Patch Version
+        if: github.ref_name == 'main'
+        id: cut-patch
+        uses: p6m-actions/dotnet-cut-tag@v1
+        with:
+          version-level: patch
+          
+      - name: Build
+        uses: p6m-actions/js-pnpm-build@v1
+
+      - name: Login to Artifactory Container Registry
+        if: github.ref_name == 'main'
+        uses: p6m-actions/docker-repository-login@v1
+        with:
+          registry: {% raw %}${{ vars.P6M_ARTIFACTORY_HOSTNAME }}{% endraw %}
+          username: {% raw %}${{ secrets.P6M_ARTIFACTORY_USERNAME }}{% endraw %}
+          password: {% raw %}${{ secrets.P6M_ARTIFACTORY_IDENTITY_TOKEN }}{% endraw %}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: p6m-actions/docker-buildx-setup@v1
+
+      - name: Build and Publish Docker Image
+        id: docker-publish
+        uses: p6m-actions/docker-buildx-build-publish@v1
+        with:
+          dockerfile-path: .platform/docker/prd/Dockerfile
+          image-name: {% raw %}${{ env.IMAGE_NAME }}{% endraw %}
+          image-tag: {% raw %}${{ steps.cut-patch.outputs.tag || format('dev-{0}', github.sha) }}{% endraw %}
+          registry: {% raw %}${{ vars.P6M_ARTIFACTORY_HOSTNAME }}/${{ vars.P6M_ARTIFACTORY_PROJECT }}-docker-local/applications{% endraw %}
+          platforms: linux/amd64,linux/arm64
+          push: {% raw %}${{ github.ref_name == 'main' }}{% endraw %}
+          skip-setup: true
+          builder-name: {% raw %}${{ steps.buildx.outputs.name }}{% endraw %}
+
+      - name: Make Artifacts
+        if: github.ref_name == 'main'
+        run: |
+          echo '{% raw %}${{ steps.docker-publish.outputs.image-digest }}{% endraw %}' | tee digest.txt
+
+      - name: Create Github release
+        if: github.ref_name == 'main'
+        uses: ncipollo/release-action@v1
+        with:
+          name: Version {% raw %}${{ steps.cut-patch.outputs.version }}{% endraw %}
+          tag: {% raw %}${{ steps.cut-patch.outputs.tag }}{% endraw %}
+          makeLatest: true
+          artifacts: "digest.txt"
+          removeArtifacts: true
+          generateReleaseNotes: true
+          body: |
+            Application version: `{% raw %}${{ steps.cut-patch.outputs.version }}{% endraw %}`
+            Docker image digest: `{% raw %}${{ steps.docker-publish.outputs.image-digest }}{% endraw %}`
+
+      - name: Update Application Manifest
+        if: github.ref_name == 'main'
+        uses: p6m-actions/platform-application-manifest-dispatch@v1
+        with:
+          repository: {% raw %}${{ github.repository }}{% endraw %}
+          image-name: {% raw %}${{ env.IMAGE_NAME }}{% endraw %}
+          environment: "dev"
+          digest: {% raw %}${{ steps.docker-publish.outputs.image-digest }}{% endraw %}
+          update-manifest-token: {% raw %}${{ secrets.P6M_UPDATE_MANIFEST_TOKEN }}{% endraw %}
+          platform-dispatch-url: {% raw %}${{ vars.P6M_PLATFORM_DISPATCH_URL }}{% endraw %}
+          directory-name: {% raw %}${{ env.APPLICATION_NAME }}{% endraw %}
