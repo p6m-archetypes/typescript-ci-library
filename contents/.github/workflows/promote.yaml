@@ -1,0 +1,42 @@
+name: Promote
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options:
+          - stg
+          - prd
+      tag:
+        description: "Release tag to promote (e.g., v1.2.3)"
+        required: true
+        type: string
+
+run-name: {% raw %}Promote ${{ inputs.tag }} to ${{ inputs.environment }}{% endraw %}
+
+permissions:
+  contents: write
+
+env:
+  IMAGE_NAME: {{ project-name }}
+  APPLICATION_NAME: {{ project-name }}
+
+jobs:
+  promote:
+    name: {% raw %}Promote to ${{ inputs.environment }}{% endraw %}
+    runs-on: ubuntu-latest
+    environment: {% raw %}${{ inputs.environment }}{% endraw %}
+    steps:
+      - name: Promote release
+        uses: p6m-actions/release-promote-to-environment@v1
+        with:
+          tag: {% raw %}${{ inputs.tag }}{% endraw %}
+          environment: {% raw %}${{ inputs.environment }}{% endraw %}
+          repository: {% raw %}${{ github.repository }}{% endraw %}
+          image-name: {% raw %}${{ env.IMAGE_NAME }}{% endraw %}
+          directory-name: {% raw %}${{ env.APPLICATION_NAME }}{% endraw %}
+          update-manifest-token: {% raw %}${{ secrets.P6M_UPDATE_MANIFEST_TOKEN }}{% endraw %}
+          platform-dispatch-url: {% raw %}${{ vars.P6M_PLATFORM_DISPATCH_URL }}{% endraw %}
