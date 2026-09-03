@@ -1,9 +1,13 @@
 name: Build
 
+# One build per logical change (YP6M-3662): the pull_request run tests the MERGE ref — what
+# main becomes — and the push run on main owns the release tail. Bare `pull_request:` would
+# decode as an absent key to the standards suite, hence the explicit `{}`.
 on:
   push:
-    branches: ["**"]
-  pull_request:
+    branches: [main]
+  pull_request: {}
+  workflow_dispatch: {}
 
 permissions:
   contents: write
