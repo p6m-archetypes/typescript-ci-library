@@ -7,7 +7,20 @@ on:
   push:
     branches: [main]
   pull_request: {}
-  workflow_dispatch: {}
+  # A manual release IS this pipeline at a chosen version level (YP6M-3663): dispatching with
+  # minor/major runs the identical cut -> build -> image -> release -> dev-dispatch tail every
+  # merge runs, so the release is promotable by construction. The tag-only cut-tag.yaml retired.
+  workflow_dispatch:
+    inputs:
+      version-level:
+        description: "Version bump level (merges always bump patch)"
+        required: false
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
 
 permissions:
   contents: write
@@ -25,12 +38,12 @@ jobs:
       - name: Setup pnpm
         uses: p6m-actions/js-pnpm-setup@v1
 
-      - name: Cut Patch Version
+      - name: Cut Version
         if: github.ref_name == 'main'
         id: cut-patch
         uses: p6m-actions/js-pnpm-cut-tag@v1
         with:
-          version-level: patch
+          version-level: {% raw %}${{ inputs.version-level || 'patch' }}{% endraw %}
           
       - name: Build
         uses: p6m-actions/js-pnpm-build@v1
