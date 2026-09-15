@@ -33,6 +33,9 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      version: {% raw %}${{ steps.cut-patch.outputs.version }}{% endraw %}
+      tag: {% raw %}${{ steps.cut-patch.outputs.tag }}{% endraw %}
     steps:
       - uses: actions/checkout@v4
       - name: Setup pnpm
@@ -48,61 +51,135 @@ jobs:
       - name: Build
         uses: p6m-actions/js-pnpm-build@v1
 
+  # Which platforms exist is the ORG's decision (YP6M-3779): P6M_IMAGE_PLATFORMS, an org-level
+  # GitHub variable, defaults to both. Each platform builds on its NATIVE runner — never qemu:
+  # emulated arm64 segfaults Node and runs compiled languages 10-50x slow (measured 2026-09-14
+  # on the first retrofit tests). An org without arm runners sets the variable to linux/amd64.
+  platforms:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: {% raw %}${{ steps.resolve.outputs.matrix }}{% endraw %}
+    steps:
+      - name: Resolve platform matrix
+        id: resolve
+        run: |
+          PLATFORMS="{% raw %}${{ vars.P6M_IMAGE_PLATFORMS || 'linux/amd64,linux/arm64' }}{% endraw %}"
+          MATRIX=$(jq -cn --arg p "$PLATFORMS" '
+            [{platform: "linux/amd64", arch: "amd64", runner: "ubuntu-latest"},
+             {platform: "linux/arm64", arch: "arm64", runner: "ubuntu-24.04-arm"}]
+            | map(select(. as $e | ($p | split(",") | map(gsub("\\s"; ""))) | index($e.platform)))')
+          echo "Platforms: $PLATFORMS -> $MATRIX"
+          if [ "$(echo "$MATRIX" | jq length)" = "0" ]; then
+            echo "::error::P6M_IMAGE_PLATFORMS ('$PLATFORMS') selects no known platform"
+            exit 1
+          fi
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  image:
+    name: {% raw %}Image (${{ matrix.platform }}){% endraw %}
+    needs: [build, platforms]
+    runs-on: {% raw %}${{ matrix.runner }}{% endraw %}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: {% raw %}${{ fromJSON(needs.platforms.outputs.matrix) }}{% endraw %}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Login to Artifactory Container Registry
         if: github.ref_name == 'main'
-        uses: p6m-actions/docker-repository-login@v1
+        uses: docker/login-action@v3
         with:
           registry: {% raw %}${{ vars.P6M_ARTIFACTORY_HOSTNAME }}{% endraw %}
           username: {% raw %}${{ secrets.P6M_ARTIFACTORY_USERNAME }}{% endraw %}
           password: {% raw %}${{ secrets.P6M_ARTIFACTORY_IDENTITY_TOKEN }}{% endraw %}
 
-      - name: Set up Docker Buildx
-        id: buildx
-        uses: p6m-actions/docker-buildx-setup@v1
-
-      - name: Build and Publish Docker Image
-        id: docker-publish
-        uses: p6m-actions/docker-buildx-build-publish@v1
+      # PR runs build (native, both platforms) without pushing; main pushes BY DIGEST — the
+      # publish job assembles the digests into one multi-arch manifest under the version tag.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
         with:
-          dockerfile-path: .platform/docker/prd/Dockerfile
-          image-name: {% raw %}${{ env.IMAGE_NAME }}{% endraw %}
-          image-tag: {% raw %}${{ steps.cut-patch.outputs.tag || format('dev-{0}', github.sha) }}{% endraw %}
-          registry: {% raw %}${{ vars.P6M_ARTIFACTORY_HOSTNAME }}/${{ vars.P6M_ARTIFACTORY_PROJECT }}-docker-local/applications{% endraw %}
-          # amd64 only (YP6M-3779): the arm64 half was QEMU-emulated on this runner — Node
-          # segfaults under qemu and cargo runs 10-50x slow — while the platform's nodes are
-          # amd64. Multi-arch returns via a native-runner matrix (YP6M-3780), never emulation.
-          platforms: linux/amd64
-          push: {% raw %}${{ github.ref_name == 'main' }}{% endraw %}
-          skip-setup: true
-          builder-name: {% raw %}${{ steps.buildx.outputs.name }}{% endraw %}
+          context: .
+          file: .platform/docker/prd/Dockerfile
+          platforms: {% raw %}${{ matrix.platform }}{% endraw %}
+          outputs: {% raw %}type=image,name=${{ vars.P6M_ARTIFACTORY_HOSTNAME }}/${{ vars.P6M_ARTIFACTORY_PROJECT }}-docker-local/applications/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.ref_name == 'main' }}{% endraw %}
 
-      - name: Make Artifacts
+      - name: Export digest
         if: github.ref_name == 'main'
         run: |
-          echo '{% raw %}${{ steps.docker-publish.outputs.image-digest }}{% endraw %}' | tee digest.txt
+          mkdir -p "$RUNNER_TEMP/digests"
+          echo "{% raw %}${{ steps.build.outputs.digest }}{% endraw %}" > "$RUNNER_TEMP/digests/digest-{% raw %}${{ matrix.arch }}{% endraw %}.txt"
+
+      - name: Upload digest
+        if: github.ref_name == 'main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-{% raw %}${{ matrix.arch }}{% endraw %}
+          path: {% raw %}${{ runner.temp }}{% endraw %}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.ref_name == 'main'
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: {% raw %}${{ runner.temp }}{% endraw %}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Login to Artifactory Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: {% raw %}${{ vars.P6M_ARTIFACTORY_HOSTNAME }}{% endraw %}
+          username: {% raw %}${{ secrets.P6M_ARTIFACTORY_USERNAME }}{% endraw %}
+          password: {% raw %}${{ secrets.P6M_ARTIFACTORY_IDENTITY_TOKEN }}{% endraw %}
+
+      - name: Assemble the multi-arch manifest
+        id: manifest
+        run: |
+          REPO="{% raw %}${{ vars.P6M_ARTIFACTORY_HOSTNAME }}/${{ vars.P6M_ARTIFACTORY_PROJECT }}-docker-local/applications/${{ env.IMAGE_NAME }}{% endraw %}"
+          TAG="{% raw %}${{ needs.build.outputs.tag }}{% endraw %}"
+          SOURCES=$(cat "$RUNNER_TEMP"/digests/digest-*.txt | xargs -n1 printf "${REPO}@%s ")
+          docker buildx imagetools create -t "${REPO}:${TAG}" ${SOURCES}
+          # The manifest list's digest IS the sha256 of its canonical bytes — computed from
+          # --raw rather than a Go-template --format, whose double-brace syntax reads as an
+          # unrendered template marker to both ATL and the standards suite.
+          DIGEST="sha256:$(docker buildx imagetools inspect --raw "${REPO}:${TAG}" | sha256sum | cut -d' ' -f1)"
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Multi-arch manifest: ${REPO}:${TAG} @ ${DIGEST}"
+
+      - name: Make Artifacts
+        run: |
+          echo '{% raw %}${{ steps.manifest.outputs.digest }}{% endraw %}' | tee digest.txt
 
       - name: Create Github release
-        if: github.ref_name == 'main'
         uses: ncipollo/release-action@v1
         with:
-          name: Version {% raw %}${{ steps.cut-patch.outputs.version }}{% endraw %}
-          tag: {% raw %}${{ steps.cut-patch.outputs.tag }}{% endraw %}
+          name: Version {% raw %}${{ needs.build.outputs.version }}{% endraw %}
+          tag: {% raw %}${{ needs.build.outputs.tag }}{% endraw %}
           makeLatest: true
           artifacts: "digest.txt"
           removeArtifacts: true
           generateReleaseNotes: true
           body: |
-            Application version: `{% raw %}${{ steps.cut-patch.outputs.version }}{% endraw %}`
-            Docker image digest: `{% raw %}${{ steps.docker-publish.outputs.image-digest }}{% endraw %}`
+            Application version: `{% raw %}${{ needs.build.outputs.version }}{% endraw %}`
+            Docker image digest: `{% raw %}${{ steps.manifest.outputs.digest }}{% endraw %}`
 
       - name: Update Application Manifest
-        if: github.ref_name == 'main'
         uses: p6m-actions/platform-application-manifest-dispatch@v1
         with:
           repository: {% raw %}${{ github.repository }}{% endraw %}
           image-name: {% raw %}${{ env.IMAGE_NAME }}{% endraw %}
           environment: "dev"
-          digest: {% raw %}${{ steps.docker-publish.outputs.image-digest }}{% endraw %}
+          digest: {% raw %}${{ steps.manifest.outputs.digest }}{% endraw %}
           update-manifest-token: {% raw %}${{ secrets.P6M_UPDATE_MANIFEST_TOKEN }}{% endraw %}
           platform-dispatch-url: {% raw %}${{ vars.P6M_PLATFORM_DISPATCH_URL }}{% endraw %}
           directory-name: {% raw %}${{ env.APPLICATION_NAME }}{% endraw %}
